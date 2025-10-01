@@ -1,0 +1,257 @@
+import csv
+import re
+from pathlib import Path
+from collections import defaultdict
+from difflib import SequenceMatcher
+import time
+def normalize_address(number, predir, stname, stsuffix, postdir, unittype, unitnum, mailcity, zip_code):
+   """Normalize address components into a standard format for matching"""
+   address_parts = []
+   if number:
+       address_parts.append(str(number))
+   if predir:
+       address_parts.append(predir)
+   if stname:
+       address_parts.append(stname)
+   if stsuffix:
+       address_parts.append(stsuffix)
+   if postdir:
+       address_parts.append(postdir)
+   if unittype and unitnum:
+       address_parts.append(f"{unittype} {unitnum}")
+   street_address = " ".join(address_parts).strip()
+   city_zip = f"{mailcity}, FL {zip_code}".strip(", ")
+   return f"{street_address}, {city_zip}".strip(", ")
+def normalize_address_from_string(address_string):
+   """Normalize address string for matching"""
+   if not address_string:
+       return ""
+   return re.sub(r'\s+', ' ', address_string.strip())
+# USPS-like normalization helpers
+_DIR_MAP = {
+   'NORTH': 'N', 'SOUTH': 'S', 'EAST': 'E', 'WEST': 'W',
+   'NORTHEAST': 'NE', 'NORTHWEST': 'NW', 'SOUTHEAST': 'SE', 'SOUTHWEST': 'SW'
+}
+_SUFFIX_MAP = {
+   'STREET': 'ST', 'AVENUE': 'AVE', 'BOULEVARD': 'BLVD', 'DRIVE': 'DR', 'COURT': 'CT',
+   'LANE': 'LN', 'ROAD': 'RD', 'TRAIL': 'TRL', 'PARKWAY': 'PKWY', 'CIRCLE': 'CIR',
+   'TERRACE': 'TER', 'PLACE': 'PL', 'HIGHWAY': 'HWY', 'WAY': 'WAY'
+}
+def _zip5(z):
+   if not z:
+       return ""
+   z = str(z).strip()
+   m = re.match(r'\d{5}', z)
+   return m.group(0) if m else z
+def _normalize_street_text(text):
+   if not text:
+       return ""
+   s = re.sub(r'\s+', ' ', text.strip()).upper()
+   tokens = s.split(' ')
+   out = []
+   for t in tokens:
+       tt = t
+       if tt in _DIR_MAP:
+           tt = _DIR_MAP[tt]
+       if tt in _SUFFIX_MAP:
+           tt = _SUFFIX_MAP[tt]
+       out.append(tt)
+   return ' '.join(out)
+def _extract_unit_from_address(street_line, addr2):
+   """Extract (unit_type, unit_num) from address lines"""
+   unit_type = ""
+   unit_num = ""
+   patterns = [
+       r"\b(APT|UNIT|STE|SUITE|BLDG|FL|FLOOR|RM|ROOM|#)\s*([A-Za-z0-9\-]+)\b",
+       r"#\s*([A-Za-z0-9\-]+)\b",
+   ]
+   srcs = [(addr2 or '').strip(), (street_line or '').strip()]
+   for src in srcs:
+       if not src:
+           continue
+       for pat in patterns:
+           m = re.search(pat, src, flags=re.IGNORECASE)
+           if m:
+               if len(m.groups()) == 2:
+                   unit_type = (m.group(1) or '').upper()
+                   unit_num = (m.group(2) or '').upper()  # keep alphanumeric
+               else:
+                   unit_type = "#"
+                   unit_num = (m.group(1) or '').upper()
+               return unit_type, unit_num
+       m2 = re.search(r"[,#\-\s](\w+)\s*$", src)
+       if m2:
+           unit_type = unit_type or 'UNIT'
+           unit_num = m2.group(1)
+           return unit_type, unit_num
+   return unit_type, unit_num
+def create_address_key(number, stname, mailcity, zip_code):
+   return f"{number}_{stname}_{mailcity}_{zip_code}".lower().replace(' ', '')
+def create_address_key_from_string(address_string):
+   if not address_string:
+       return ""
+   parts = address_string.split(',')
+   if len(parts) >= 2:
+       street_part = parts[0].strip()
+       city_zip_part = parts[1].strip()
+       street_words = street_part.split()
+       number = street_words[0] if street_words and street_words[0].isdigit() else ""
+       street_name = " ".join(street_words[1:]) if len(street_words) > 1 else street_part
+       city_zip_words = city_zip_part.split()
+       zip_code = city_zip_words[-1] if city_zip_words and city_zip_words[-1].isdigit() else ""
+       city = " ".join(city_zip_words[:-1]) if len(city_zip_words) > 1 else city_zip_part
+       return f"{number}_{street_name}_{city}_{zip_code}".lower().replace(' ', '')
+   return address_string.lower().replace(' ', '')
+def generate_address_queries(street, city, zip_code):
+   """Generate multiple variations of an address string for matching"""
+   queries = []
+   base_addr = f"{street}, {city}, FL {zip_code}"
+   queries.append(normalize_address_from_string(base_addr).lower())
+   norm_street = _normalize_street_text(street)
+   alt_addr = f"{norm_street}, {city}, FL {zip_code}"
+   queries.append(normalize_address_from_string(alt_addr).lower())
+   parts = street.split()
+   if len(parts) > 2 and parts[-1].upper() in _DIR_MAP.values():
+       no_postdir = " ".join(parts[:-1])
+       alt_addr2 = f"{no_postdir}, {city}, FL {zip_code}"
+       queries.append(normalize_address_from_string(alt_addr2).lower())
+   if len(parts) > 1 and parts[-1].upper() in _SUFFIX_MAP.values():
+       no_suffix = " ".join(parts[:-1])
+       alt_addr3 = f"{no_suffix}, {city}, FL {zip_code}"
+       queries.append(normalize_address_from_string(alt_addr3).lower())
+   return list(dict.fromkeys(queries))  # remove duplicates
+def fuzzy_match_addresses():
+   """Perform exact + multi-query matching using parcel file as baseline.
+   Outputs Matched.csv and Unmatched.csv.
+   """
+   file1_path = Path("OSCEOLA_2025-01-01.csv")
+   file2_path = Path("NAL59P202501.csv")
+
+
+   output_path = Path("Matched.csv")
+   if not file1_path.exists():
+       print(f"Error: {file1_path} not found!")
+       return
+   if not file2_path.exists():
+       print(f"Error: {file2_path} not found!")
+       return
+   print("Reading first file (coordinates) and building lookup...")
+   coord_lookup_norm = {}
+   coord_lookup_key = {}
+   t0 = time.time()
+   with open(file1_path, 'r', encoding='utf-8', errors='ignore') as infile:
+       reader = csv.DictReader(infile)
+       for row in reader:
+           number = (row.get('NUMBER', '') or '').strip()
+           predir = (row.get('PREDIR', '') or '').strip()
+           stname = (row.get('STNAME', '') or '').strip()
+           stsuffix = (row.get('STSUFFIX', '') or '').strip()
+           postdir = (row.get('POSTDIR', '') or '').strip()
+           mailcity = (row.get('MAILCITY', '') or '').strip()
+           zip_code = _zip5(row.get('ZIP', ''))
+           if not all([number, stname, mailcity, zip_code]):
+               continue
+           normalized_address = normalize_address(number, predir, stname, stsuffix, postdir, '', '', mailcity, zip_code)
+           norm_key = normalize_address_from_string(normalized_address).lower()
+           coord_lookup_norm[norm_key] = row
+           key = create_address_key(number, stname, mailcity, zip_code)
+           coord_lookup_key[key] = row
+   print(f"Built coordinate lookup for {len(coord_lookup_norm):,} addresses in {time.time() - t0:.1f}s")
+   print("Reading parcel file (baseline) and matching...")
+   matched_data = []
+   unmatched_data = []
+   match_stats = {'exact_key': 0, 'exact_address': 0, 'no_match': 0}
+   with open(file2_path, 'r', encoding='utf-8', errors='ignore') as infile:
+       reader = csv.DictReader(infile)
+       for i, row in enumerate(reader):
+           if i % 50000 == 0:
+               print(f"  Processed {i:,} parcel rows...")
+           street = (row.get('PHY_ADDR1', '') or '').strip()
+           city = (row.get('PHY_CITY', '') or '').strip()
+           zip_code = _zip5(row.get('PHY_ZIPCD', ''))
+           parcel_id = row.get('PARCEL_ID', '')
+           unit_type, unit_num = _extract_unit_from_address(row.get('PHY_ADDR1', ''), row.get('PHY_ADDR2', ''))
+           if not all([street, city, zip_code]):
+               unmatched_data.append(row)
+               match_stats['no_match'] += 1
+               continue
+           coord_row = None
+           matched = False
+           match_method = ''
+           # Try multiple query variations
+           for query in generate_address_queries(street, city, zip_code):
+               if query in coord_lookup_norm:
+                   coord_row = coord_lookup_norm[query]
+                   match_stats['exact_address'] += 1
+                   match_method = 'exact_address'
+                   matched = True
+                   break
+           # Fallback: key-based exact match
+           if not matched:
+               parts = street.split()
+               number = parts[0] if parts and parts[0].isdigit() else ''
+               stname = ' '.join(parts[1:]) if len(parts) > 1 else street
+               key = create_address_key(street.split()[0] if street.split() and street.split()[0].isdigit() else '', stname, city, zip_code)
+               coord_row = coord_lookup_key.get(key)
+               if coord_row:
+                   match_stats['exact_key'] += 1
+                   match_method = 'exact_key'
+                   matched = True
+           if unit_num and not unit_type:
+               unit_type = 'UNIT'
+           if matched and coord_row:
+               output_row = dict(row)
+               for k, v in coord_row.items():
+                   output_row[k] = v
+               if unit_type:
+                   output_row['UNITTYPE'] = unit_type
+               if unit_num:
+                   output_row['UNITNUM'] = unit_num
+               output_row['match_method'] = match_method
+               matched_data.append(output_row)
+           else:
+               output_row = dict(row)
+               if unit_type:
+                   output_row['UNITTYPE'] = unit_type
+               if unit_num:
+                   output_row['UNITNUM'] = unit_num
+               unmatched_data.append(output_row)
+               match_stats['no_match'] += 1
+   print(f"\nMatching completed:")
+   print(f"  Exact key matches: {match_stats['exact_key']:,}")
+   print(f"  Exact address matches: {match_stats['exact_address']:,}")
+   print(f"  No matches: {match_stats['no_match']:,}")
+   print(f"\nWriting matched data to {output_path}...")
+   if matched_data:
+       matched_fieldnames = []
+       seen = set()
+       for row in matched_data:
+           for k in row.keys():
+               if k not in seen:
+                   seen.add(k)
+                   matched_fieldnames.append(k)
+       with open(output_path, 'w', newline='', encoding='utf-8') as outfile:
+           writer = csv.DictWriter(outfile, fieldnames=matched_fieldnames)
+           writer.writeheader()
+           for r in matched_data:
+               writer.writerow({k: r.get(k, "") for k in matched_fieldnames})
+       print(f"✓ Successfully wrote {len(matched_data):,} rows to {output_path}")
+       unmatched_path = Path("Unmatched.csv")
+       if unmatched_data:
+           unmatched_fieldnames = []
+           seen_un = set()
+           for row in unmatched_data:
+               for k in row.keys():
+                   if k not in seen_un:
+                       seen_un.add(k)
+                       unmatched_fieldnames.append(k)
+           with open(unmatched_path, 'w', newline='', encoding='utf-8') as outfile2:
+               writer2 = csv.DictWriter(outfile2, fieldnames=unmatched_fieldnames)
+               writer2.writeheader()
+               for r in unmatched_data:
+                   writer2.writerow({k: r.get(k, "") for k in unmatched_fieldnames})
+           print(f"✓ Wrote {len(unmatched_data):,} unmatched rows to {unmatched_path}")
+   else:
+       print("No data to write!")
+if __name__ == "__main__":
+   fuzzy_match_addresses()
